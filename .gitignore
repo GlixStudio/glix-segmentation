@@ -23,7 +23,7 @@ wheels/
 .installed.cfg
 *.egg
 captures/
-
+.ipynb_checkpoints/
 # Conda
 .conda/
 

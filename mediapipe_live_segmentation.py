@@ -909,8 +909,8 @@ def main():
                     cv2.resizeWindow("Live Segmentation", width, height)
                     print("Fullscreen: OFF")
             elif key == ord('s'):
-                cv2.imwrite(f"segmented_frame_{frame_count}.jpg", display_frame)
-                print(f"Saved: segmented_frame_{frame_count}.jpg")
+                cv2.imwrite(f"./captures/segmented_frame_{frame_count}.jpg", display_frame)
+                print(f"Saved: ./captures/segmented_frame_{frame_count}.jpg")
             
             frame_count += 1
             
