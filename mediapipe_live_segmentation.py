@@ -15,6 +15,42 @@ import time
 import urllib.request
 import random
 import glob
+import platform
+
+def get_screen_resolution():
+    """Get the primary screen resolution."""
+    try:
+        if platform.system() == 'Darwin':  # macOS
+            try:
+                from AppKit import NSScreen
+                screen = NSScreen.mainScreen()
+                frame = screen.frame()
+                return int(frame.size.width), int(frame.size.height)
+            except ImportError:
+                # Fallback to tkinter if AppKit not available
+                import tkinter as tk
+                root = tk.Tk()
+                width = root.winfo_screenwidth()
+                height = root.winfo_screenheight()
+                root.destroy()
+                return width, height
+        elif platform.system() == 'Windows':
+            import tkinter as tk
+            root = tk.Tk()
+            width = root.winfo_screenwidth()
+            height = root.winfo_screenheight()
+            root.destroy()
+            return width, height
+        else:  # Linux
+            import tkinter as tk
+            root = tk.Tk()
+            width = root.winfo_screenwidth()
+            height = root.winfo_screenheight()
+            root.destroy()
+            return width, height
+    except:
+        # Fallback: return a common resolution
+        return 1920, 1080
 
 # Pre-computed constants for performance
 # Categories: 0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=others
@@ -814,6 +850,8 @@ def main():
     show_text = True
     is_fullscreen = False
     segmenter.enable_face_landmarks = True  # Default: face landmarks ON
+    screen_width, screen_height = get_screen_resolution()
+    print(f"Screen resolution: {screen_width}x{screen_height}")
     
     # Create main window - resizable and fullscreen-capable
     cv2.namedWindow("Live Segmentation", cv2.WINDOW_NORMAL)
@@ -872,8 +910,12 @@ def main():
                 gpu = "GPU" if segmenter.use_gpu else "CPU"
                 status = "✓" if has_mask else "⏳"
                 
-                cv2.putText(display_frame, f"{mode} | {gpu} {status} | FPS: {fps:.1f}",
+                cv2.putText(display_frame, f"{mode} | {gpu} {status} | FPS: {fps:.1f} | Proc: {processing_size}px",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Resize frame to fill screen when in fullscreen mode
+            if is_fullscreen:
+                display_frame = cv2.resize(display_frame, (screen_width, screen_height), interpolation=cv2.INTER_LINEAR)
             
             cv2.imshow("Live Segmentation", display_frame)
             
@@ -901,8 +943,10 @@ def main():
                 # Toggle fullscreen
                 is_fullscreen = not is_fullscreen
                 if is_fullscreen:
+                    # Get current screen resolution (in case it changed)
+                    screen_width, screen_height = get_screen_resolution()
                     cv2.setWindowProperty("Live Segmentation", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-                    print("Fullscreen: ON")
+                    print(f"Fullscreen: ON ({screen_width}x{screen_height})")
                 else:
                     cv2.setWindowProperty("Live Segmentation", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
                     # Restore window size
