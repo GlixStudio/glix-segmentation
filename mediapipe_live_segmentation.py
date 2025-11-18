@@ -18,9 +18,14 @@ import glob
 import platform
 
 def get_screen_resolution():
-    """Get the primary screen resolution."""
+    """Get the primary screen resolution.
+    
+    Note: platform.system() == 'Darwin' detects macOS because macOS is built on Darwin,
+    the underlying Unix-like operating system kernel. Darwin is the open-source component
+    of macOS, so checking for 'Darwin' is the standard way to detect macOS in Python.
+    """
     try:
-        if platform.system() == 'Darwin':  # macOS
+        if platform.system() == 'Darwin':  # macOS (Darwin is the underlying OS kernel)
             try:
                 from AppKit import NSScreen
                 screen = NSScreen.mainScreen()
@@ -51,6 +56,38 @@ def get_screen_resolution():
     except:
         # Fallback: return a common resolution
         return 1920, 1080
+
+def resize_to_fill_screen(frame, target_width, target_height):
+    """Resize frame to fill screen while maintaining aspect ratio (cover mode).
+    This ensures no gray areas appear - the frame will be cropped if needed."""
+    frame_height, frame_width = frame.shape[:2]
+    
+    # Calculate aspect ratios
+    frame_aspect = frame_width / frame_height
+    screen_aspect = target_width / target_height
+    
+    # Scale to cover the entire screen (fill mode)
+    if frame_aspect > screen_aspect:
+        # Frame is wider - scale based on height, crop width
+        scale = target_height / frame_height
+        new_width = int(frame_width * scale)
+        new_height = target_height
+    else:
+        # Frame is taller - scale based on width, crop height
+        scale = target_width / frame_width
+        new_width = target_width
+        new_height = int(frame_height * scale)
+    
+    # Resize the frame
+    resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+    
+    # Crop to exact screen size if needed (center crop)
+    if new_width != target_width or new_height != target_height:
+        start_x = (new_width - target_width) // 2
+        start_y = (new_height - target_height) // 2
+        resized = resized[start_y:start_y + target_height, start_x:start_x + target_width]
+    
+    return resized
 
 # Pre-computed constants for performance
 # Categories: 0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=others
@@ -913,9 +950,9 @@ def main():
                 cv2.putText(display_frame, f"{mode} | {gpu} {status} | FPS: {fps:.1f} | Proc: {processing_size}px",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            # Resize frame to fill screen when in fullscreen mode
+            # Resize frame to fill screen when in fullscreen mode (maintain aspect ratio)
             if is_fullscreen:
-                display_frame = cv2.resize(display_frame, (screen_width, screen_height), interpolation=cv2.INTER_LINEAR)
+                display_frame = resize_to_fill_screen(display_frame, screen_width, screen_height)
             
             cv2.imshow("Live Segmentation", display_frame)
             
