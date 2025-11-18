@@ -925,6 +925,9 @@ def main():
             if not ret:
                 break
             
+            # Mirror the camera view horizontally (like a mirror)
+            frame = cv2.flip(frame, 1)
+            
             # Skip warmup frames - don't render camera feed, just process
             if frame_count < warmup_frames:
                 # Process frame but don't display (camera feed is hidden)
@@ -979,10 +982,11 @@ def main():
             # Only show text if toggle is on
             if show_text:
                 mode = "Textures" if (has_mask and segmenter.use_textures) else "Mask"
-                gpu = "GPU" if segmenter.use_gpu else "CPU"
+                # Ensure GPU status is always a valid string
+                gpu_status = "GPU" if (hasattr(segmenter, 'use_gpu') and segmenter.use_gpu) else "CPU"
                 status = "✓" if has_mask else "⏳"
                 
-                cv2.putText(display_frame, f"{mode} | {gpu} {status} | FPS: {fps:.1f} | Proc: {processing_size}px",
+                cv2.putText(display_frame, f"{mode} | {gpu_status} {status} | FPS: {fps:.1f} | Proc: {processing_size}px",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
             # Resize frame to fill screen when in fullscreen mode (maintain aspect ratio)
