@@ -116,6 +116,11 @@ class LiveSegmentation:
         self.use_srgba = self.use_gpu
         self.enable_face_landmarks = True
         
+        # Error tracking for automatic GPU fallback
+        self.gpu_error_count = 0
+        self.max_gpu_errors = 10  # Switch to CPU after this many consecutive errors
+        self.error_lock = threading.Lock()
+        
         # Configurable parameters
         self.blend_factor = 0.3
         self.blur_kernel_size = 35
@@ -353,7 +358,9 @@ class LiveSegmentation:
                     mask = result.category_mask.numpy_view()
                     with self.lock:
                         self.latest_mask = mask
-            except:
+            except Exception as e:
+                # Silently handle callback errors - MediaPipe may send invalid data
+                # Don't crash the application on callback errors
                 pass
         
         base_options = BaseOptions(
@@ -393,7 +400,9 @@ class LiveSegmentation:
                     if result and result.face_landmarks:
                         with self.face_lock:
                             self.latest_face_landmarks = result
-                except:
+                except Exception as e:
+                    # Silently handle face landmark callback errors
+                    # Don't crash the application on callback errors
                     pass
             
             base_options = BaseOptions(
@@ -453,10 +462,26 @@ class LiveSegmentation:
             if self.face_landmarker:
                 try:
                     self.face_landmarker.detect_async(mp_image, timestamp_ms)
-                except:
+                except Exception as e:
+                    # Silently handle face landmark errors (non-critical)
                     pass
-        except:
-            pass
+            
+            # Reset error count on successful processing
+            with self.error_lock:
+                if self.gpu_error_count > 0:
+                    self.gpu_error_count = 0
+                    
+        except Exception as e:
+            # Handle MediaPipe errors gracefully
+            with self.error_lock:
+                self.gpu_error_count += 1
+                
+                # If too many GPU errors, suggest CPU fallback
+                if self.use_gpu and self.gpu_error_count >= self.max_gpu_errors:
+                    print(f"\n⚠️ Multiple GPU errors detected ({self.gpu_error_count}). Consider restarting with CPU mode.")
+                    print("   The application will continue running but may have reduced performance.")
+                    self.gpu_error_count = 0  # Reset to avoid spam
+            # Continue running - don't crash on errors
     
     # Removed get_segmented_frame - only using mask-only mode for speed
     
@@ -904,15 +929,23 @@ def main():
             if frame_count < warmup_frames:
                 # Process frame but don't display (camera feed is hidden)
                 if frame_count % process_every_n == 0:
-                    timestamp_ms = int((time.time() - start_time) * 1000)
-                    segmenter.process_frame(frame, timestamp_ms, processing_size)
+                    try:
+                        timestamp_ms = int((time.time() - start_time) * 1000)
+                        segmenter.process_frame(frame, timestamp_ms, processing_size)
+                    except Exception as e:
+                        # Silently handle processing errors - continue with next frame
+                        pass
                 frame_count += 1
                 continue
             
             # Process frame
             if frame_count % process_every_n == 0:
-                timestamp_ms = int((time.time() - start_time) * 1000)
-                segmenter.process_frame(frame, timestamp_ms, processing_size)
+                try:
+                    timestamp_ms = int((time.time() - start_time) * 1000)
+                    segmenter.process_frame(frame, timestamp_ms, processing_size)
+                except Exception as e:
+                    # Silently handle processing errors - continue with next frame
+                    pass
             
             # Fast non-blocking mask check
             try:
@@ -926,7 +959,8 @@ def main():
             if has_mask:
                 try:
                     display_frame = segmenter.get_mask_only(frame, show_categories=True)
-                except:
+                except Exception as e:
+                    # Fallback to black frame on error
                     display_frame = np.zeros_like(frame)
             else:
                 display_frame = np.zeros_like(frame)
@@ -935,7 +969,8 @@ def main():
             if segmenter.enable_face_landmarks and segmenter.face_landmarker:
                 try:
                     display_frame = segmenter.draw_face_landmarks(display_frame)
-                except:
+                except Exception as e:
+                    # Silently handle face landmark drawing errors
                     pass
             
             elapsed = time.time() - start_time
@@ -952,9 +987,18 @@ def main():
             
             # Resize frame to fill screen when in fullscreen mode (maintain aspect ratio)
             if is_fullscreen:
-                display_frame = resize_to_fill_screen(display_frame, screen_width, screen_height)
+                try:
+                    display_frame = resize_to_fill_screen(display_frame, screen_width, screen_height)
+                except Exception as e:
+                    # If resize fails, use original frame
+                    pass
             
-            cv2.imshow("Live Segmentation", display_frame)
+            try:
+                cv2.imshow("Live Segmentation", display_frame)
+            except Exception as e:
+                # Handle display errors gracefully
+                print(f"⚠️ Display error (non-fatal): {e}")
+                # Continue running
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -990,8 +1034,12 @@ def main():
                     cv2.resizeWindow("Live Segmentation", width, height)
                     print("Fullscreen: OFF")
             elif key == ord('s'):
-                cv2.imwrite(f"./captures/segmented_frame_{frame_count}.jpg", display_frame)
-                print(f"Saved: ./captures/segmented_frame_{frame_count}.jpg")
+                try:
+                    os.makedirs("captures", exist_ok=True)
+                    cv2.imwrite(f"./captures/segmented_frame_{frame_count}.jpg", display_frame)
+                    print(f"Saved: ./captures/segmented_frame_{frame_count}.jpg")
+                except Exception as e:
+                    print(f"⚠️ Failed to save frame: {e}")
             
             frame_count += 1
             
@@ -1001,11 +1049,26 @@ def main():
                 print(f"FPS: {fps:.1f} | Processed: {proc_fps:.1f} | Frames: {frame_count}")
     
     except KeyboardInterrupt:
-        pass
+        print("\n⚠️ Interrupted by user")
+    except Exception as e:
+        # Catch any unexpected errors and log them, but try to continue
+        print(f"\n⚠️ Unexpected error in main loop: {e}")
+        print("   Attempting to continue...")
+        import traceback
+        traceback.print_exc()
     finally:
-        cap.release()
-        segmenter.close()
-        cv2.destroyAllWindows()
+        try:
+            cap.release()
+        except:
+            pass
+        try:
+            segmenter.close()
+        except:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
         print(f"\nProcessed {frame_count} frames")
 
 
