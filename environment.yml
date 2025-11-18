@@ -1,0 +1,16 @@
+name: yolo-detection
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy>=1.24.0
+  - jupyter
+  - ipython
+  - notebook
+  - ipykernel
+  - pip:
+    - mediapipe>=0.10.0
+    - opencv-contrib-python>=4.8.0
+
