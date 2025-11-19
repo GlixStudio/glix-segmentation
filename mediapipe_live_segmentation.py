@@ -1085,10 +1085,6 @@ def main():
     # control_panel = ControlPanel(segmenter)
     # control_panel.set_cam_resolution(width, height)
     
-    # Auto-randomize textures on startup (non-blocking)
-    print("\n🎲 Auto-loading random textures...")
-    segmenter.randomize_textures()
-    
     # Processing size settings - cycle through with hotkey
     processing_sizes = [256, 320, 384, 448, 512, 576, 640]
     processing_size_idx = 6  # Start at 384 (index 2)
@@ -1097,6 +1093,18 @@ def main():
     frame_count = 0
     start_time = time.time()
     process_every_n = 1 if segmenter.use_gpu else 2
+    
+    # Automatic texture randomization and capture timers
+    randomize_interval = 20.0  # Randomize every 20 seconds
+    capture_delay = 5.0  # First capture 5 seconds after randomize
+    capture_interval = 10.0  # Then capture every 10 seconds
+    last_capture_time = 0  # Track last capture time
+    
+    # Auto-randomize textures on startup (non-blocking)
+    print("\n🎲 Auto-loading random textures...")
+    segmenter.randomize_textures()
+    last_randomize_time = time.time()  # Set after initial randomize
+    last_capture_time = last_randomize_time  # Initialize capture time
     
     # Warmup: skip first few frames to let camera stabilize
     warmup_frames = 5
@@ -1193,6 +1201,41 @@ def main():
                 except Exception as e:
                     # Silently handle face landmark drawing errors
                     pass
+            
+            # Automatic texture randomization every 20 seconds
+            current_time = time.time()
+            time_since_randomize = current_time - last_randomize_time
+            
+            if time_since_randomize >= randomize_interval:
+                print(f"\n🎲 Auto-randomizing textures (every {randomize_interval}s)...")
+                segmenter.randomize_textures()
+                last_randomize_time = current_time
+                last_capture_time = last_randomize_time  # Reset capture time for first capture after randomize
+            
+            # Automatic capture: first capture 5 seconds after randomize, then every 10 seconds
+            time_since_capture = current_time - last_capture_time
+            time_since_randomize = current_time - last_randomize_time
+            
+            # Check if it's time to capture:
+            # 1. First capture: 5 seconds after randomize (when last_capture_time <= last_randomize_time)
+            # 2. Subsequent captures: every 10 seconds after the last capture
+            should_capture = False
+            if last_capture_time <= last_randomize_time and time_since_randomize >= capture_delay:
+                # First capture after randomize (5 seconds)
+                should_capture = True
+            elif last_capture_time > last_randomize_time and time_since_capture >= capture_interval:
+                # Subsequent captures (every 10 seconds)
+                should_capture = True
+            
+            if should_capture:
+                try:
+                    os.makedirs("captures", exist_ok=True)
+                    capture_filename = f"./captures/segmented_frame_{int(current_time)}.jpg"
+                    cv2.imwrite(capture_filename, display_frame)
+                    print(f"📸 Auto-captured: {capture_filename}")
+                    last_capture_time = current_time
+                except Exception as e:
+                    print(f"⚠️ Failed to auto-capture frame: {e}")
             
             elapsed = time.time() - start_time
             fps = frame_count / elapsed if elapsed > 0 else 0
