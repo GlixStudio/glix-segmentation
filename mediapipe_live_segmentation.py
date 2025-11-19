@@ -473,7 +473,7 @@ class LiveSegmentation:
             options = FaceLandmarkerOptions(
                 base_options=base_options,
                 running_mode=VisionRunningMode.LIVE_STREAM,
-                num_faces=1,
+                num_faces=5,  # Support up to 5 faces
                 min_face_detection_confidence=0.5,
                 min_face_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
@@ -770,93 +770,166 @@ class LiveSegmentation:
         return cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
     
     def draw_face_landmarks(self, frame):
-        """Draw face landmarks as a mesh with connections."""
+        """Draw face landmarks as a mesh with connections for all detected faces."""
         # Fast lock check
         try:
             with self.face_lock:
                 if self.latest_face_landmarks is None or not self.latest_face_landmarks.face_landmarks:
                     return frame
-                face_landmarks = self.latest_face_landmarks.face_landmarks[0]
+                all_face_landmarks = self.latest_face_landmarks.face_landmarks
         except:
             return frame
         
         h, w = frame.shape[:2]
         
-        if len(face_landmarks) < 478:
-            return frame  # Invalid landmark data
-        
-        # Pre-compute all landmark points (reuse pre-allocated array)
-        num_landmarks = len(face_landmarks)
-        if num_landmarks > len(self._landmark_points):
-            # Resize if needed (shouldn't happen, but safe)
-            self._landmark_points = np.zeros((num_landmarks, 2), dtype=np.int32)
-        
-        # Update in-place to avoid allocation
-        for i, lm in enumerate(face_landmarks):
-            self._landmark_points[i, 0] = int(lm.x * w)
-            self._landmark_points[i, 1] = int(lm.y * h)
-        points = self._landmark_points[:num_landmarks]
-        
-        # Use randomized color scheme that changes with textures
-        LANDMARK_COLOR, CONNECTION_COLOR, KEY_POINT_COLOR = self.current_landmark_colors
-        
-        # Only draw eyes, nose, and mouth mesh
-        
-        # Nose bridge (27-30)
-        for i in range(27, 30):
-            pt1, pt2 = tuple(points[i]), tuple(points[i + 1])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        
-        # Nose tip (30-35)
-        for i in range(30, 35):
-            pt1, pt2 = tuple(points[i]), tuple(points[i + 1])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        
-        # Left eye - connect in order
-        left_eye_indices = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-        left_eye_valid = [i for i in left_eye_indices if i < len(points)]
-        for i in range(len(left_eye_valid) - 1):
-            pt1, pt2 = tuple(points[left_eye_valid[i]]), tuple(points[left_eye_valid[i + 1]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        if len(left_eye_valid) > 2:
-            # Close the eye loop
-            pt1, pt2 = tuple(points[left_eye_valid[-1]]), tuple(points[left_eye_valid[0]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        
-        # Right eye - connect in order
-        right_eye_indices = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-        right_eye_valid = [i for i in right_eye_indices if i < len(points)]
-        for i in range(len(right_eye_valid) - 1):
-            pt1, pt2 = tuple(points[right_eye_valid[i]]), tuple(points[right_eye_valid[i + 1]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        if len(right_eye_valid) > 2:
-            # Close the eye loop
-            pt1, pt2 = tuple(points[right_eye_valid[-1]]), tuple(points[right_eye_valid[0]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        
-        # Mouth outer
-        mouth_outer_indices = [61, 146, 91, 181, 84, 17, 314, 405, 320, 307, 375, 321, 308, 324, 318]
-        mouth_outer_valid = [i for i in mouth_outer_indices if i < len(points)]
-        for i in range(len(mouth_outer_valid) - 1):
-            pt1, pt2 = tuple(points[mouth_outer_valid[i]]), tuple(points[mouth_outer_valid[i + 1]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        if len(mouth_outer_valid) > 2:
-            # Close the mouth loop
-            pt1, pt2 = tuple(points[mouth_outer_valid[-1]]), tuple(points[mouth_outer_valid[0]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        
-        # Mouth inner
-        mouth_inner_indices = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324]
-        mouth_inner_valid = [i for i in mouth_inner_indices if i < len(points)]
-        for i in range(len(mouth_inner_valid) - 1):
-            pt1, pt2 = tuple(points[mouth_inner_valid[i]]), tuple(points[mouth_inner_valid[i + 1]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
-        if len(mouth_inner_valid) > 2:
-            # Close the inner mouth loop
-            pt1, pt2 = tuple(points[mouth_inner_valid[-1]]), tuple(points[mouth_inner_valid[0]])
-            cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+        # Draw landmarks for each detected face
+        for face_idx, face_landmarks in enumerate(all_face_landmarks):
+            if len(face_landmarks) < 478:
+                continue  # Skip invalid landmark data
+            
+            # Pre-compute all landmark points (reuse pre-allocated array)
+            num_landmarks = len(face_landmarks)
+            if num_landmarks > len(self._landmark_points):
+                # Resize if needed (shouldn't happen, but safe)
+                self._landmark_points = np.zeros((num_landmarks, 2), dtype=np.int32)
+            
+            # Update in-place to avoid allocation
+            for i, lm in enumerate(face_landmarks):
+                self._landmark_points[i, 0] = int(lm.x * w)
+                self._landmark_points[i, 1] = int(lm.y * h)
+            points = self._landmark_points[:num_landmarks]
+            
+            # Use different color for each face to distinguish them
+            # Cycle through color schemes based on face index
+            color_scheme_idx = face_idx % len(self.landmark_color_schemes)
+            LANDMARK_COLOR, CONNECTION_COLOR, KEY_POINT_COLOR = self.landmark_color_schemes[color_scheme_idx]
+            
+            # Only draw eyes, nose, and mouth mesh
+            
+            # Nose bridge (27-30)
+            for i in range(27, 30):
+                pt1, pt2 = tuple(points[i]), tuple(points[i + 1])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            
+            # Nose tip (30-35)
+            for i in range(30, 35):
+                pt1, pt2 = tuple(points[i]), tuple(points[i + 1])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            
+            # Left eye - connect in order
+            left_eye_indices = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+            left_eye_valid = [i for i in left_eye_indices if i < len(points)]
+            for i in range(len(left_eye_valid) - 1):
+                pt1, pt2 = tuple(points[left_eye_valid[i]]), tuple(points[left_eye_valid[i + 1]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            if len(left_eye_valid) > 2:
+                # Close the eye loop
+                pt1, pt2 = tuple(points[left_eye_valid[-1]]), tuple(points[left_eye_valid[0]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            
+            # Right eye - connect in order
+            right_eye_indices = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+            right_eye_valid = [i for i in right_eye_indices if i < len(points)]
+            for i in range(len(right_eye_valid) - 1):
+                pt1, pt2 = tuple(points[right_eye_valid[i]]), tuple(points[right_eye_valid[i + 1]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            if len(right_eye_valid) > 2:
+                # Close the eye loop
+                pt1, pt2 = tuple(points[right_eye_valid[-1]]), tuple(points[right_eye_valid[0]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            
+            # Mouth outer
+            mouth_outer_indices = [61, 146, 91, 181, 84, 17, 314, 405, 320, 307, 375, 321, 308, 324, 318]
+            mouth_outer_valid = [i for i in mouth_outer_indices if i < len(points)]
+            for i in range(len(mouth_outer_valid) - 1):
+                pt1, pt2 = tuple(points[mouth_outer_valid[i]]), tuple(points[mouth_outer_valid[i + 1]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            if len(mouth_outer_valid) > 2:
+                # Close the mouth loop
+                pt1, pt2 = tuple(points[mouth_outer_valid[-1]]), tuple(points[mouth_outer_valid[0]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            
+            # Mouth inner
+            mouth_inner_indices = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324]
+            mouth_inner_valid = [i for i in mouth_inner_indices if i < len(points)]
+            for i in range(len(mouth_inner_valid) - 1):
+                pt1, pt2 = tuple(points[mouth_inner_valid[i]]), tuple(points[mouth_inner_valid[i + 1]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
+            if len(mouth_inner_valid) > 2:
+                # Close the inner mouth loop
+                pt1, pt2 = tuple(points[mouth_inner_valid[-1]]), tuple(points[mouth_inner_valid[0]])
+                cv2.line(frame, pt1, pt2, CONNECTION_COLOR, 1)
         
         return frame
+    
+    def overlay_logo(self, frame, logo_path="glixLogo.jpeg", max_height=80, opacity=1, bg_opacity=1):
+        """Overlay logo at the top right of the frame with semi-transparent background."""
+        try:
+            if not os.path.exists(logo_path):
+                return frame
+            
+            # Load logo
+            logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+            if logo is None:
+                return frame
+            
+            h, w = frame.shape[:2]
+            logo_h, logo_w = logo.shape[:2]
+            
+            # Calculate scale to fit max_height while maintaining aspect ratio
+            scale = min(max_height / logo_h, (w * 0.3) / logo_w)  # Max 30% of frame width
+            new_logo_w = int(logo_w * scale)
+            new_logo_h = int(logo_h * scale)
+            
+            # Resize logo
+            if logo.shape[2] == 4:  # Has alpha channel
+                logo_resized = cv2.resize(logo, (new_logo_w, new_logo_h), interpolation=cv2.INTER_AREA)
+            else:
+                logo_resized = cv2.resize(logo, (new_logo_w, new_logo_h), interpolation=cv2.INTER_AREA)
+                # Add alpha channel if missing
+                logo_resized = cv2.cvtColor(logo_resized, cv2.COLOR_BGR2BGRA)
+                logo_resized[:, :, 3] = 255  # Full opacity
+            
+            # Calculate position (top right)
+            x_offset = w - new_logo_w - 20  # 20 pixels from right edge
+            y_offset = 20  # 20 pixels from top
+            
+            # Get the region where logo will be placed
+            y1, y2 = y_offset, y_offset + new_logo_h
+            x1, x2 = x_offset, x_offset + new_logo_w
+            
+            # Make sure we don't go out of bounds
+            if y2 > h or x2 > w or x1 < 0 or y1 < 0:
+                return frame
+            
+            # Add semi-transparent background behind logo
+            padding = 4  # Padding around logo (reduced for thinner borders)
+            bg_y1 = max(0, y1 - padding)
+            bg_y2 = min(h, y2 + padding)
+            bg_x1 = max(0, x1 - padding)
+            bg_x2 = min(w, x2 + padding)
+            
+            # Create semi-transparent black background
+            bg_alpha = bg_opacity
+            frame_bg_region = frame[bg_y1:bg_y2, bg_x1:bg_x2].copy()
+            bg_overlay = np.zeros_like(frame_bg_region)
+            bg_blended = (bg_alpha * bg_overlay + (1 - bg_alpha) * frame_bg_region).astype(np.uint8)
+            frame[bg_y1:bg_y2, bg_x1:bg_x2] = bg_blended
+            
+            # Extract alpha channel and normalize for logo
+            alpha = logo_resized[:, :, 3].astype(np.float32) / 255.0 * opacity
+            alpha_3d = np.stack([alpha, alpha, alpha], axis=2)
+            
+            # Blend logo with frame (over the background)
+            logo_bgr = logo_resized[:, :, :3]
+            frame_region = frame[y1:y2, x1:x2]
+            blended = (alpha_3d * logo_bgr + (1 - alpha_3d) * frame_region).astype(np.uint8)
+            frame[y1:y2, x1:x2] = blended
+            
+            return frame
+        except Exception as e:
+            # Silently fail if logo overlay fails
+            return frame
     
     def close(self):
         if self.segmenter:
@@ -1228,6 +1301,16 @@ def main():
                     # Silently handle face landmark drawing errors
                     pass
             
+            # Save frame for capture (before logo overlay) - captures should not include logo
+            capture_frame = display_frame.copy()
+            
+            # Overlay Glix logo at top center (only for display, not for captures)
+            try:
+                display_frame = segmenter.overlay_logo(display_frame)
+            except Exception as e:
+                # Silently handle logo overlay errors
+                pass
+            
             # Automatic texture randomization every 20 seconds
             current_time = time.time()
             time_since_randomize = current_time - last_randomize_time
@@ -1257,7 +1340,7 @@ def main():
                 try:
                     os.makedirs("captures", exist_ok=True)
                     capture_filename = f"./captures/segmented_frame_{int(current_time)}.jpg"
-                    cv2.imwrite(capture_filename, display_frame)
+                    cv2.imwrite(capture_filename, capture_frame)  # Use capture_frame without logo
                     print(f"📸 Auto-captured: {capture_filename}")
                     last_capture_time = current_time
                 except Exception as e:
@@ -1341,7 +1424,8 @@ def main():
             elif key == ord('s'):
                 try:
                     os.makedirs("captures", exist_ok=True)
-                    cv2.imwrite(f"./captures/segmented_frame_{frame_count}.jpg", display_frame)
+                    # Save frame without logo - use capture_frame which is defined before logo overlay
+                    cv2.imwrite(f"./captures/segmented_frame_{frame_count}.jpg", capture_frame)
                     print(f"Saved: ./captures/segmented_frame_{frame_count}.jpg")
                 except Exception as e:
                     print(f"⚠️ Failed to save frame: {e}")
