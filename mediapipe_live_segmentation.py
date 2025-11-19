@@ -121,6 +121,7 @@ class LiveSegmentation:
         self.use_gpu = use_gpu if use_gpu is not None else True
         self.use_srgba = self.use_gpu
         self.enable_face_landmarks = True
+        self.detect_multiple_faces = True  # Default to multiple face detection
         
         # Error tracking for automatic GPU fallback
         self.gpu_error_count = 0
@@ -473,7 +474,7 @@ class LiveSegmentation:
             options = FaceLandmarkerOptions(
                 base_options=base_options,
                 running_mode=VisionRunningMode.LIVE_STREAM,
-                num_faces=5,  # Support up to 5 faces
+                num_faces=5 if self.detect_multiple_faces else 1,  # Toggle between 1 and 5 faces
                 min_face_detection_confidence=0.5,
                 min_face_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
@@ -931,6 +932,43 @@ class LiveSegmentation:
             # Silently fail if logo overlay fails
             return frame
     
+    def toggle_multiple_face_detection(self):
+        """Toggle between single and multiple face detection."""
+        self.detect_multiple_faces = not self.detect_multiple_faces
+        
+        # Recreate face landmarker with new num_faces setting
+        if self.enable_face_landmarks and self.face_landmarker:
+            try:
+                # Wait for pending operations to complete
+                max_wait = 50
+                wait_count = 0
+                while wait_count < max_wait:
+                    # Small delay to let any pending operations complete
+                    time.sleep(0.01)
+                    wait_count += 1
+                
+                # Close old face landmarker
+                try:
+                    if self.face_landmarker:
+                        self.face_landmarker.close()
+                except:
+                    pass
+                
+                # Force GC to collect Python-side objects
+                gc.collect()
+                
+                # Recreate face landmarker with new setting
+                self.face_landmarker = self._create_face_landmarker()
+                self._face_landmarker_frame_count = 0
+                
+                mode = "multiple faces (up to 5)" if self.detect_multiple_faces else "single face"
+                print(f"✅ Face detection mode: {mode}")
+                return True
+            except Exception as e:
+                print(f"⚠️ Failed to toggle face detection mode: {e}")
+                return False
+        return False
+    
     def close(self):
         if self.segmenter:
             self.segmenter.close()
@@ -1151,6 +1189,7 @@ def main():
     print("  'p' - Cycle processing size (256-640px)")
     print("  'x' - Toggle textures on/off")
     print("  'b' - Toggle background effects (keep original background)")
+    print("  'n' - Toggle multiple face detection (1 vs 5 faces)")
     print("  'f' - Toggle fullscreen")
     print("  's' - Save current frame")
     print("=" * 50 + "\n")
@@ -1422,6 +1461,9 @@ def main():
                 # Toggle background effects
                 segmenter.keep_background_original = not segmenter.keep_background_original
                 print(f"Background effects: {'OFF (original)' if segmenter.keep_background_original else 'ON (effects applied)'}")
+            elif key == ord('n'):
+                # Toggle multiple face detection
+                segmenter.toggle_multiple_face_detection()
             elif key == ord('f'):
                 # Toggle fullscreen
                 is_fullscreen = not is_fullscreen
