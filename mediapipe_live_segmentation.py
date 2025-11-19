@@ -131,6 +131,7 @@ class LiveSegmentation:
         self.blend_factor = 0.3
         self.blur_kernel_size = 35
         self.use_textures = True  # Start with textures ON
+        self.keep_background_original = True  # Keep background as original (no effects) - toggle with 'b'
         self.textures = {}  # Store textures for each category: {0: texture_img, 1: texture_img, ...}
         self.texture_scales = {}  # Random scale for each category
         self.texture_folders = ["textures/GANSTILLFINAL", "textures/tiles2"]  # Folders with texture PNGs (inside textures folder)
@@ -672,26 +673,34 @@ class LiveSegmentation:
         
         if show_categories and self.use_textures and self.textures:
             # ULTRA-OPTIMIZED: Use direct mask indexing instead of np.where
-            # Reuse output buffer to reduce allocations
-            if self._output_buffer is None or self._output_buffer.shape != (h, w, 3):
-                self._output_buffer = np.zeros((h, w, 3), dtype=np.uint8)
-            output = self._output_buffer
-            
-            # Only initialize with category colors for categories without textures
-            categories_with_textures = set(self.textures.keys())
-            categories_without_textures = set(range(6)) - categories_with_textures
+            if self.keep_background_original:
+                # Start with original frame (background will remain unchanged)
+                output = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB).copy()
+                # Only initialize with category colors for categories without textures
+                # Exclude category 0 (background) - keep original frame for background
+                categories_with_textures = set(self.textures.keys())
+                categories_without_textures = set(range(1, 6)) - categories_with_textures  # Exclude category 0
+            else:
+                # Start with zeros (apply effects to all categories including background)
+                if self._output_buffer is None or self._output_buffer.shape != (h, w, 3):
+                    self._output_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+                output = self._output_buffer
+                # Only initialize with category colors for categories without textures
+                categories_with_textures = set(self.textures.keys())
+                categories_without_textures = set(range(6)) - categories_with_textures  # Include category 0
+                
             if categories_without_textures:
                 # Only set colors for categories that don't have textures
                 for cat_id in categories_without_textures:
                     cat_mask = (mask == cat_id)
                     if np.any(cat_mask):
                         output[cat_mask] = CATEGORY_COLORS[cat_id]
-            else:
-                # All categories have textures, start with zeros
-                output.fill(0)
             
-            # Only process categories that have textures loaded
+            # Process categories that have textures loaded
             for cat_id in self.textures:
+                # Skip category 0 (background) if keep_background_original is True
+                if self.keep_background_original and cat_id == 0:
+                    continue
                 cat_mask = (mask == cat_id)
                 if not np.any(cat_mask):
                     continue
@@ -735,12 +744,28 @@ class LiveSegmentation:
                 # Direct assignment (fastest path - no alpha checking or blending)
                 output[y_coords, x_coords] = texture_scaled[tex_y, tex_x, :3]
         elif show_categories:
-            # Fastest path: direct color lookup
-            output = CATEGORY_COLORS[mask]
+            if self.keep_background_original:
+                # Start with original frame (background will remain unchanged)
+                output = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB).copy()
+                # Apply colors only to human categories (1-5), skip background (0)
+                human_mask = (mask > 0) & (mask < 6)
+                if np.any(human_mask):
+                    output[human_mask] = CATEGORY_COLORS[mask[human_mask]]
+            else:
+                # Apply colors to all categories including background
+                output = CATEGORY_COLORS[mask]
         else:
             # Binary mask
-            person_mask = mask > 0
-            output = np.where(person_mask[:, :, np.newaxis], [255, 255, 255], [0, 0, 0]).astype(np.uint8)
+            if self.keep_background_original:
+                # Keep background as original frame
+                output = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB).copy()
+                person_mask = mask > 0
+                if np.any(person_mask):
+                    output[person_mask] = [255, 255, 255]
+            else:
+                # Binary mask with black background
+                person_mask = mask > 0
+                output = np.where(person_mask[:, :, np.newaxis], [255, 255, 255], [0, 0, 0]).astype(np.uint8)
         
         return cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
     
@@ -1052,6 +1077,7 @@ def main():
     print("  't' - Toggle text display")
     print("  'p' - Cycle processing size (256-640px)")
     print("  'x' - Toggle textures on/off")
+    print("  'b' - Toggle background effects (keep original background)")
     print("  'f' - Toggle fullscreen")
     print("  's' - Save current frame")
     print("=" * 50 + "\n")
@@ -1246,9 +1272,10 @@ def main():
                 # Ensure GPU status is always a valid string
                 gpu_status = "GPU" if (hasattr(segmenter, 'use_gpu') and segmenter.use_gpu) else "CPU"
                 status = "✓" if has_mask else "⏳"
+                bg_status = "BG:Orig" if segmenter.keep_background_original else "BG:FX"
                 
                 # Create text string once and reuse
-                text_overlay = f"{mode} | {gpu_status} {status} | FPS: {fps:.1f} | Proc: {processing_size}px"
+                text_overlay = f"{mode} | {gpu_status} {status} | {bg_status} | FPS: {fps:.1f} | Proc: {processing_size}px"
                 cv2.putText(display_frame, text_overlay,
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 del text_overlay  # Clear string reference immediately
@@ -1294,6 +1321,10 @@ def main():
                 # Toggle textures on/off
                 segmenter.use_textures = not segmenter.use_textures
                 print(f"Textures: {'ON' if segmenter.use_textures else 'OFF'}")
+            elif key == ord('b'):
+                # Toggle background effects
+                segmenter.keep_background_original = not segmenter.keep_background_original
+                print(f"Background effects: {'OFF (original)' if segmenter.keep_background_original else 'ON (effects applied)'}")
             elif key == ord('f'):
                 # Toggle fullscreen
                 is_fullscreen = not is_fullscreen
