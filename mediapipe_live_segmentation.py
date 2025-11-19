@@ -16,6 +16,9 @@ import urllib.request
 import random
 import glob
 import platform
+from collections import OrderedDict
+import gc  # For explicit garbage collection
+import tracemalloc  # For memory leak detection
 
 def get_screen_resolution():
     """Get the primary screen resolution.
@@ -85,7 +88,10 @@ def resize_to_fill_screen(frame, target_width, target_height):
     if new_width != target_width or new_height != target_height:
         start_x = (new_width - target_width) // 2
         start_y = (new_height - target_height) // 2
-        resized = resized[start_y:start_y + target_height, start_x:start_x + target_width]
+        # Create a view/copy for the cropped region
+        cropped = resized[start_y:start_y + target_height, start_x:start_x + target_width].copy()
+        del resized  # Explicitly delete intermediate array
+        return cropped
     
     return resized
 
@@ -129,8 +135,35 @@ class LiveSegmentation:
         self.texture_scales = {}  # Random scale for each category
         self.texture_folders = ["textures/GANSTILLFINAL", "textures/tiles2"]  # Folders with texture PNGs (inside textures folder)
         self.texture_files = []  # List of available texture files
-        self._tiled_cache = {}  # Cache tiled textures: {(cat_id, scale, w, h): tiled_texture}
+        self._tiled_cache = OrderedDict()  # Cache tiled textures: {(cat_id, scale): tiled_texture} - FIFO eviction
         self._last_frame_size = None  # Track frame size changes
+        
+        # Pre-allocated buffers to reduce memory allocations
+        self._output_buffer = None  # Reusable output buffer
+        self._alpha_channel = None  # Reusable alpha channel for RGBA
+        self._cached_mask = None  # Cached resized mask
+        self._cached_mask_size = None  # Size of cached mask
+        self._landmark_points = np.zeros((478, 2), dtype=np.int32)  # Pre-allocated landmark points
+        
+        # Frame skipping to prevent queue buildup
+        self._last_processed_timestamp = 0
+        self._processing_queue_size = 0  # Track approximate queue size
+        self._max_queue_size = 2  # Skip frames if queue gets too large (reduced from 3)
+        self._frames_skipped = 0  # Track skipped frames for monitoring
+        self._last_gc_time = time.time()  # Track last GC time
+        
+        # CRITICAL: Track pending async operations to prevent unbounded queue
+        # MediaPipe's async queue is in C++ and Python GC can't free it
+        self._pending_segments = 0  # Count of pending segment operations
+        self._max_pending = 2  # Maximum pending operations before blocking
+        self._pending_lock = threading.Lock()  # Lock for pending counter
+        
+        # CRITICAL: Track segmenter recreation to force memory release
+        # MediaPipe's C++ code holds memory that Python GC can't free
+        # Recreating the segmenter forces MediaPipe to release all internal buffers
+        self._segmenter_frame_count = 0  # Frames processed by current segmenter
+        self._max_segmenter_frames = 500  # Recreate segmenter every 500 frames (~50 seconds at 10 FPS) to force memory release
+        self._model_path = None  # Store model path for recreation
         
         # Face landmark color schemes (BGR format for OpenCV)
         # Each scheme has: landmark_color, connection_color, key_point_color
@@ -157,13 +190,16 @@ class LiveSegmentation:
         if model_path is None:
             model_path = self._download_model()
         
+        self._model_path = model_path  # Store for recreation
         self.segmenter = self._create_segmenter(model_path)
         
         # Initialize face landmarker
         if self.enable_face_landmarks:
             self.face_landmarker = self._create_face_landmarker()
+            self._face_landmarker_frame_count = 0  # Track frames for face landmarker too
         else:
             self.face_landmarker = None
+            self._face_landmarker_frame_count = 0
         
         # Load texture file list
         self._load_texture_file_list()
@@ -195,9 +231,12 @@ class LiveSegmentation:
             print("❌ No texture files found in texture folders")
             return False
         
-        self.textures = {}
-        self.texture_scales = {}
-        self._tiled_cache = {}  # Clear cache when textures change
+        # Explicitly free old textures to prevent memory accumulation
+        for texture in self.textures.values():
+            del texture
+        self.textures.clear()
+        self.texture_scales.clear()
+        self._tiled_cache.clear()  # Clear cache when textures change
         
         # Randomize face landmark colors too
         color_names = ["Cyan/Yellow", "Green/Magenta", "Red/Cyan", "Yellow/Blue", 
@@ -295,10 +334,9 @@ class LiveSegmentation:
             
             # Cache only the scaled texture (much smaller than full tiled)
             self._tiled_cache[cache_key] = texture_scaled
-            # Limit cache size
+            # Limit cache size with proper FIFO eviction
             if len(self._tiled_cache) > 12:
-                oldest_key = next(iter(self._tiled_cache))
-                del self._tiled_cache[oldest_key]
+                self._tiled_cache.popitem(last=False)  # Remove oldest entry (FIFO)
         
         tex_h_scaled, tex_w_scaled = texture_scaled.shape[:2]
         
@@ -354,13 +392,31 @@ class LiveSegmentation:
         
         def result_callback(result, output_image, timestamp_ms):
             try:
+                # CRITICAL: Decrement pending counter when callback executes
+                # This means MediaPipe has finished processing and released the frame
+                with self._pending_lock:
+                    if self._pending_segments > 0:
+                        self._pending_segments -= 1
+                
                 if hasattr(result, 'category_mask') and result.category_mask is not None:
-                    mask = result.category_mask.numpy_view()
+                    # CRITICAL: Copy the numpy view to break MediaPipe's reference
+                    # This prevents MediaPipe from holding onto old mask data
+                    mask_view = result.category_mask.numpy_view()
+                    mask = mask_view.copy()  # Create independent copy
+                    del mask_view  # Release view reference immediately
+                    
                     with self.lock:
+                        # Clear old mask reference before assigning new one
+                        old_mask = self.latest_mask
                         self.latest_mask = mask
+                        del old_mask  # Explicitly delete old reference
             except Exception as e:
                 # Silently handle callback errors - MediaPipe may send invalid data
                 # Don't crash the application on callback errors
+                # Still decrement counter even on error
+                with self._pending_lock:
+                    if self._pending_segments > 0:
+                        self._pending_segments -= 1
                 pass
         
         base_options = BaseOptions(
@@ -399,7 +455,10 @@ class LiveSegmentation:
                 try:
                     if result and result.face_landmarks:
                         with self.face_lock:
+                            # Clear old landmark reference before assigning new one
+                            old_landmarks = self.latest_face_landmarks
                             self.latest_face_landmarks = result
+                            del old_landmarks  # Explicitly delete old reference
                 except Exception as e:
                     # Silently handle face landmark callback errors
                     # Don't crash the application on callback errors
@@ -447,24 +506,123 @@ class LiveSegmentation:
         #     frame_resized = cv2.merge([l, a, b])
         #     frame_resized = cv2.cvtColor(frame_resized, cv2.COLOR_LAB2BGR)
         
-        rgb_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        # CRITICAL: Periodically recreate segmenter to force MediaPipe to release C++ memory
+        # MediaPipe's C++ code holds memory that Python GC can't free
+        # Recreating the segmenter forces MediaPipe to release all internal buffers
+        self._segmenter_frame_count += 1
+        if self._segmenter_frame_count >= self._max_segmenter_frames:
+            print(f"🔄 Recreating segmenter to force memory release (processed {self._segmenter_frame_count} frames)...")
+            
+            # Wait for pending operations to complete
+            max_wait = 50  # Wait up to 50 iterations
+            wait_count = 0
+            while wait_count < max_wait:
+                with self._pending_lock:
+                    pending = self._pending_segments
+                if pending == 0:
+                    break
+                time.sleep(0.01)  # Wait 10ms
+                wait_count += 1
+            
+            # Close old segmenter
+            try:
+                if self.segmenter:
+                    self.segmenter.close()
+            except:
+                pass
+            
+            # Force GC to collect Python-side objects
+            gc.collect()
+            
+            # Recreate segmenter - this forces MediaPipe to release C++ memory
+            self.segmenter = self._create_segmenter(self._model_path)
+            self._segmenter_frame_count = 0
+            print("✅ Segmenter recreated")
         
+        # CRITICAL: Check MediaPipe's async queue size before processing
+        # MediaPipe queues frames in C++ memory - Python GC can't free them!
+        with self._pending_lock:
+            pending = self._pending_segments
+        
+        # If too many frames are pending, skip this frame to prevent queue buildup
+        if pending >= self._max_pending:
+            self._frames_skipped += 1
+            # If we've skipped many frames, wait a bit for queue to drain
+            if self._frames_skipped > 5:
+                time.sleep(0.01)  # Small sleep to let queue drain
+            return
+        
+        # AGGRESSIVE Frame skipping: Don't process if queue is too full (prevents memory buildup)
+        time_since_last = timestamp_ms - self._last_processed_timestamp
+        
+        # More aggressive skipping - only process every 33ms (~30 FPS max) instead of 16ms
+        # This prevents MediaPipe's internal queue from growing unbounded
+        if time_since_last < 33:  # ~30 FPS max processing rate (was 16ms/60 FPS)
+            self._frames_skipped += 1
+            return
+        
+        # If we've skipped many frames, force GC to clean up
+        if self._frames_skipped > 10:
+            current_time = time.time()
+            if current_time - self._last_gc_time > 1.0:  # GC at most once per second
+                gc.collect()
+                self._last_gc_time = current_time
+            self._frames_skipped = 0
+        
+        # CRITICAL: Copy frame data to break any references MediaPipe might hold
+        # MediaPipe's async queue holds references to the numpy arrays
+        rgb_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB).copy()  # Explicit copy
+        
+        # Reuse alpha channel buffer to reduce allocations
         if self.use_srgba:
-            rgba_frame = np.dstack([rgb_frame, np.full((rgb_frame.shape[0], rgb_frame.shape[1]), 255, dtype=np.uint8)])
+            h, w = rgb_frame.shape[:2]
+            if self._alpha_channel is None or self._alpha_channel.shape != (h, w):
+                self._alpha_channel = np.full((h, w), 255, dtype=np.uint8)
+            # Create RGBA frame - copy to ensure MediaPipe doesn't hold reference to our buffers
+            rgba_frame = np.dstack([rgb_frame, self._alpha_channel]).copy()
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgba_frame)
         else:
+            # Already copied above, but ensure we're passing a copy
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         
         try:
+            # CRITICAL: Increment pending counter BEFORE async call
+            # This tracks how many frames MediaPipe is holding in its C++ queue
+            with self._pending_lock:
+                self._pending_segments += 1
+            
             self.segmenter.segment_async(mp_image, timestamp_ms)
+            self._last_processed_timestamp = timestamp_ms
             
             # Process face landmarks in parallel (same frame)
             if self.face_landmarker:
+                # Also recreate face landmarker periodically
+                self._face_landmarker_frame_count += 1
+                if self._face_landmarker_frame_count >= self._max_segmenter_frames:
+                    print(f"🔄 Recreating face landmarker to force memory release...")
+                    try:
+                        if self.face_landmarker:
+                            self.face_landmarker.close()
+                    except:
+                        pass
+                    gc.collect()
+                    self.face_landmarker = self._create_face_landmarker()
+                    self._face_landmarker_frame_count = 0
+                    print("✅ Face landmarker recreated")
+                
                 try:
                     self.face_landmarker.detect_async(mp_image, timestamp_ms)
                 except Exception as e:
                     # Silently handle face landmark errors (non-critical)
                     pass
+            
+            # Explicitly release MediaPipe image references to help GC
+            # CRITICAL: This helps break references so GC can collect them
+            del mp_image
+            if self.use_srgba:
+                del rgba_frame
+            del rgb_frame
+            del frame_resized
             
             # Reset error count on successful processing
             with self.error_lock:
@@ -491,23 +649,46 @@ class LiveSegmentation:
         with self.lock:
             if self.latest_mask is None:
                 return np.zeros_like(original_frame)
-            mask = self.latest_mask.copy()  # Copy needed for thread safety
+            # No copy needed - lock protects access and we're not modifying mask
+            mask = self.latest_mask
         
         h, w = original_frame.shape[:2]
         
-        # Fast resize if needed
+        # Cache resized mask to avoid repeated resizing
         if mask.shape[:2] != (h, w):
-            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+            # Check if we can reuse cached mask
+            if self._cached_mask is None or self._cached_mask_size != (h, w) or self._cached_mask.shape[:2] != mask.shape[:2]:
+                # Resize and cache
+                self._cached_mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                self._cached_mask_size = (h, w)
+            mask = self._cached_mask
         
         # Clear cache if frame size changed
         if self._last_frame_size != (h, w):
-            self._tiled_cache = {}
+            self._tiled_cache.clear()  # Clear cache when frame size changes
+            self._cached_mask = None  # Invalidate cached mask
+            self._cached_mask_size = None
             self._last_frame_size = (h, w)
         
         if show_categories and self.use_textures and self.textures:
             # ULTRA-OPTIMIZED: Use direct mask indexing instead of np.where
-            # Pre-allocate output with category colors (fastest base)
-            output = CATEGORY_COLORS[mask].copy()
+            # Reuse output buffer to reduce allocations
+            if self._output_buffer is None or self._output_buffer.shape != (h, w, 3):
+                self._output_buffer = np.zeros((h, w, 3), dtype=np.uint8)
+            output = self._output_buffer
+            
+            # Only initialize with category colors for categories without textures
+            categories_with_textures = set(self.textures.keys())
+            categories_without_textures = set(range(6)) - categories_with_textures
+            if categories_without_textures:
+                # Only set colors for categories that don't have textures
+                for cat_id in categories_without_textures:
+                    cat_mask = (mask == cat_id)
+                    if np.any(cat_mask):
+                        output[cat_mask] = CATEGORY_COLORS[cat_id]
+            else:
+                # All categories have textures, start with zeros
+                output.fill(0)
             
             # Only process categories that have textures loaded
             for cat_id in self.textures:
@@ -535,8 +716,7 @@ class LiveSegmentation:
                         texture_scaled = texture.copy()
                     self._tiled_cache[cache_key] = texture_scaled
                     if len(self._tiled_cache) > 12:
-                        oldest_key = next(iter(self._tiled_cache))
-                        del self._tiled_cache[oldest_key]
+                        self._tiled_cache.popitem(last=False)  # Remove oldest entry (FIFO)
                 
                 tex_h_scaled, tex_w_scaled = texture_scaled.shape[:2]
                 
@@ -580,8 +760,17 @@ class LiveSegmentation:
         if len(face_landmarks) < 478:
             return frame  # Invalid landmark data
         
-        # Pre-compute all landmark points (vectorized for performance)
-        points = np.array([(int(lm.x * w), int(lm.y * h)) for lm in face_landmarks], dtype=np.int32)
+        # Pre-compute all landmark points (reuse pre-allocated array)
+        num_landmarks = len(face_landmarks)
+        if num_landmarks > len(self._landmark_points):
+            # Resize if needed (shouldn't happen, but safe)
+            self._landmark_points = np.zeros((num_landmarks, 2), dtype=np.int32)
+        
+        # Update in-place to avoid allocation
+        for i, lm in enumerate(face_landmarks):
+            self._landmark_points[i, 0] = int(lm.x * w)
+            self._landmark_points[i, 1] = int(lm.y * h)
+        points = self._landmark_points[:num_landmarks]
         
         # Use randomized color scheme that changes with textures
         LANDMARK_COLOR, CONNECTION_COLOR, KEY_POINT_COLOR = self.current_landmark_colors
@@ -881,6 +1070,10 @@ def main():
         segmenter.close()
         return
     
+    # CRITICAL: Reduce OpenCV buffer size to prevent frame accumulation
+    # This prevents OpenCV from buffering too many frames in memory
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer - only keep latest frame
+    
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -907,6 +1100,31 @@ def main():
     
     # Warmup: skip first few frames to let camera stabilize
     warmup_frames = 5
+    
+    # Garbage collection settings - MORE AGGRESSIVE
+    gc_frequency = 30  # Run GC every 30 frames (was 60) - more frequent
+    gc_threshold = (500, 5, 5)  # Even more aggressive GC thresholds (was 700, 10, 10)
+    gc.set_threshold(*gc_threshold)
+    
+    # CRITICAL: Enable tracemalloc to track actual memory allocations
+    # This will show us what Python objects are actually leaking
+    tracemalloc.start()
+    snapshot_before = tracemalloc.take_snapshot()
+    
+    # Memory monitoring (optional - graceful fallback if psutil not available)
+    try:
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+        memory_monitoring = True
+    except ImportError:
+        print("⚠️ psutil not installed - memory monitoring disabled")
+        memory_monitoring = False
+        initial_memory = 0
+        process = None
+    last_memory_log = time.time()
+    last_tracemalloc_snapshot = time.time()
     
     # Display settings
     show_text = True
@@ -986,19 +1204,28 @@ def main():
                 gpu_status = "GPU" if (hasattr(segmenter, 'use_gpu') and segmenter.use_gpu) else "CPU"
                 status = "✓" if has_mask else "⏳"
                 
-                cv2.putText(display_frame, f"{mode} | {gpu_status} {status} | FPS: {fps:.1f} | Proc: {processing_size}px",
+                # Create text string once and reuse
+                text_overlay = f"{mode} | {gpu_status} {status} | FPS: {fps:.1f} | Proc: {processing_size}px"
+                cv2.putText(display_frame, text_overlay,
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                del text_overlay  # Clear string reference immediately
             
             # Resize frame to fill screen when in fullscreen mode (maintain aspect ratio)
             if is_fullscreen:
                 try:
+                    # Store old reference before creating new one
+                    old_display_frame = display_frame
                     display_frame = resize_to_fill_screen(display_frame, screen_width, screen_height)
+                    # Explicitly delete old frame to free memory immediately
+                    del old_display_frame
                 except Exception as e:
                     # If resize fails, use original frame
                     pass
             
             try:
                 cv2.imshow("Live Segmentation", display_frame)
+                # Note: cv2.imshow may buffer frames internally, but we can't control that
+                # The frame will be collected by GC after we delete the reference
             except Exception as e:
                 # Handle display errors gracefully
                 print(f"⚠️ Display error (non-fatal): {e}")
@@ -1047,10 +1274,82 @@ def main():
             
             frame_count += 1
             
+            # Periodic garbage collection to prevent memory accumulation
+            if frame_count % gc_frequency == 0:
+                # Force garbage collection every N frames
+                collected = gc.collect()
+                
+                # Memory monitoring - log if memory is growing
+                if memory_monitoring:
+                    current_time = time.time()
+                    if current_time - last_memory_log > 5.0:  # Check every 5 seconds
+                        current_memory = process.memory_info().rss / 1024 / 1024  # MB
+                        memory_delta = current_memory - initial_memory
+                        
+                        # Check what Python objects are actually leaking
+                        if current_time - last_tracemalloc_snapshot > 10.0:  # Every 10 seconds
+                            snapshot_after = tracemalloc.take_snapshot()
+                            top_stats = snapshot_after.compare_to(snapshot_before, 'lineno')
+                            
+                            print(f"\n🔍 Top 5 memory allocations:")
+                            for index, stat in enumerate(top_stats[:5], 1):
+                                print(f"  {index}. {stat}")
+                            
+                            last_tracemalloc_snapshot = current_time
+                        
+                        # Show pending MediaPipe operations
+                        with segmenter._pending_lock:
+                            pending = segmenter._pending_segments
+                        
+                        if collected > 0:
+                            print(f"🧹 GC collected {collected} objects | Memory: {current_memory:.1f} MB (+{memory_delta:.1f} MB) | Pending: {pending}")
+                        last_memory_log = current_time
+            
+            # Print FPS stats before clearing variables
             if frame_count % 60 == 0:
                 processed = frame_count // process_every_n
                 proc_fps = processed / elapsed if elapsed > 0 else 0
-                print(f"FPS: {fps:.1f} | Processed: {proc_fps:.1f} | Frames: {frame_count}")
+                
+                # Get current memory before print (if monitoring enabled)
+                if memory_monitoring:
+                    current_memory = process.memory_info().rss / 1024 / 1024  # MB
+                    memory_delta = current_memory - initial_memory
+                    
+                    # Get pending MediaPipe operations
+                    with segmenter._pending_lock:
+                        pending = segmenter._pending_segments
+                    
+                    # Create print string and immediately print, then clear variables
+                    log_msg = f"FPS: {fps:.1f} | Processed: {proc_fps:.1f} | Frames: {frame_count} | Mem: {current_memory:.1f} MB (+{memory_delta:.1f} MB) | Pending: {pending}"
+                    
+                    # If memory is growing too much, be even more aggressive
+                    if memory_delta > 100:  # If memory increased by more than 100 MB
+                        log_msg += " ⚠️ HIGH MEM!"
+                        print(f"⚠️ High memory usage detected! Pending operations: {pending}")
+                        print(f"   This suggests MediaPipe's C++ queue is holding frames")
+                        # Can't force MediaPipe to release - it's in C++ code
+                        # But we can skip more frames
+                        segmenter._max_pending = max(1, segmenter._max_pending - 1)
+                        print(f"   Reduced max pending to {segmenter._max_pending}")
+                        for _ in range(3):  # Multiple GC passes for Python objects
+                            gc.collect()
+                else:
+                    # Still show pending even without psutil
+                    with segmenter._pending_lock:
+                        pending = segmenter._pending_segments
+                    log_msg = f"FPS: {fps:.1f} | Processed: {proc_fps:.1f} | Frames: {frame_count} | Pending: {pending}"
+                
+                print(log_msg)
+                del log_msg, processed, proc_fps  # Clear temporary variables
+                
+                # Force GC after EVERY print to prevent accumulation
+                gc.collect()
+            
+            # Clear frame references to help GC (after all uses)
+            del display_frame
+            # Note: 'frame' is read at start of loop, so deleting here is fine
+            # It will be reassigned on next iteration
+            del frame
     
     except KeyboardInterrupt:
         print("\n⚠️ Interrupted by user")
