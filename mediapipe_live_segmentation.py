@@ -1198,6 +1198,7 @@ def main():
     capture_delay = 5.0  # First capture 5 seconds after randomize
     capture_interval = 10.0  # Then capture every 10 seconds
     last_capture_time = 0  # Track last capture time
+    textures_need_toggle_back = False  # Track if textures need to be toggled back on
     
     # Auto-randomize textures on startup (non-blocking)
     print("\n🎲 Auto-loading random textures...")
@@ -1316,8 +1317,21 @@ def main():
             time_since_randomize = current_time - last_randomize_time
             
             if time_since_randomize >= randomize_interval:
+                # If textures were toggled off previously, toggle them back on first
+                if textures_need_toggle_back:
+                    segmenter.use_textures = True
+                    textures_need_toggle_back = False
+                    print(f"\n🎲 Toggling textures back ON...")
+                
                 print(f"\n🎲 Auto-randomizing textures (every {randomize_interval}s)...")
                 segmenter.randomize_textures()
+                
+                # Occasionally toggle textures off (30% chance)
+                if random.random() < 0.3:
+                    segmenter.use_textures = False
+                    textures_need_toggle_back = True
+                    print(f"   ⚠️ Textures toggled OFF (will toggle back ON next cycle)")
+                
                 last_randomize_time = current_time
                 last_capture_time = last_randomize_time  # Reset capture time for first capture after randomize
             
